@@ -1,0 +1,17 @@
+node_modules/
+build/
+dist/
+backend/__pycache__/
+frontend/node_modules/
+frontend/build/
+.env
+.env.*
+backend/.env
+frontend/.env
+*.pyc
+*.pyo
+*.log
+.DS_Store
+Thumbs.db
+frontend/.env
+backend/.env

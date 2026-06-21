@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: instagram-downloader-backend
+    runtime: python
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: python instaloader_server.py
+    envVars:
+      - key: PORT
+        value: 5000
+      - key: NODE_ENV
+        value: production
+      - key: FRONTEND_URL
+        sync: false
+  - type: web
+    name: instagram-downloader-frontend
+    runtime: static
+    rootDir: frontend
+    buildCommand: npm install && npm run build
+    staticPublishPath: build
+    envVars:
+      - key: REACT_APP_API_URL
+        sync: false
