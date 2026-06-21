@@ -72,6 +72,12 @@ function Downloader({ onDownloadSuccess }) {
           : 'Too many requests. Please wait a moment and try again.';
       } else if (err.response?.status === 504) {
         errorMessage = 'Server timeout. The media file is too large or connection is slow.';
+      } else if (err.response?.status === 403) {
+        errorMessage = err.response.data?.error || 'Instagram requires login for this content.';
+      } else if (err.response?.status === 404) {
+        errorMessage = err.response.data?.error || 'Instagram post not found.';
+      } else if (err.response?.status === 500 || err.response?.status === 502) {
+        errorMessage = err.response.data?.error || err.response.data?.details || 'Server error while fetching media.';
       } else if (err.code === 'ECONNABORTED') {
         errorMessage = 'Request timeout. Please try again with a different link.';
       } else if (err.message === 'Network Error') {

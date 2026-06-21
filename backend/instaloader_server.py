@@ -142,6 +142,25 @@ def fetch_post_data(url: str):
     return {"items": items, "raw": raw}
 
 
+def classify_instaloader_error(exc: Exception):
+    message = str(exc)
+    lowered = message.lower()
+
+    if "too many requests" in lowered or "429" in lowered:
+        return 429, "Instagram is rate-limiting this request. Try again later."
+    if "login required" in lowered or "please login" in lowered:
+        return 403, "Instagram requires login for this content."
+    if "not found" in lowered or "404" in lowered:
+        return 404, "Instagram post not found."
+    if "proxyerror" in lowered or "connection refused" in lowered:
+        return 502, "The backend could not reach Instagram from this host."
+    if "ssl" in lowered or "certificate" in lowered:
+        return 502, "SSL/TLS failed while connecting to Instagram."
+    if "graphql/query" in lowered or "json query" in lowered:
+        return 502, "Instagram blocked or rejected the metadata request."
+    return 500, "Failed to download content. Please check the URL and try again."
+
+
 def get_cached(url: str):
     with state_lock:
         entry = download_cache.get(url)
@@ -367,10 +386,12 @@ class Handler(BaseHTTPRequestHandler):
         try:
             result = fetch_post_data(url)
         except Exception as exc:
+            status, user_message = classify_instaloader_error(exc)
+            print(f"[instaloader] {status} {exc}")
             self._json(
-                500,
+                status,
                 {
-                    "error": "Failed to download content. Please check the URL and try again.",
+                    "error": user_message,
                     "details": str(exc),
                     "provider": "instaloader",
                 },
