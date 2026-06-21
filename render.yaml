@@ -14,6 +14,12 @@ services:
         sync: false
       - key: FRONTEND_URLS
         sync: false
+      - key: INSTAGRAM_SESSIONID
+        sync: false
+      - key: INSTAGRAM_CSRFTOKEN
+        sync: false
+      - key: INSTAGRAM_COOKIE_HEADER
+        sync: false
   - type: web
     name: instagram-downloader-frontend
     runtime: static

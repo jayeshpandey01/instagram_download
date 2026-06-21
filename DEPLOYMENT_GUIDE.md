@@ -22,6 +22,10 @@ Environment variables:
 PORT=5000
 NODE_ENV=production
 FRONTEND_URL=https://your-frontend-domain
+# Optional: authenticated Instagram session for harder-to-fetch posts
+INSTAGRAM_SESSIONID=...
+INSTAGRAM_CSRFTOKEN=...
+INSTAGRAM_COOKIE_HEADER=sessionid=...; csrftoken=...
 ```
 
 ### 2. Frontend service
@@ -100,4 +104,3 @@ Open the `downloadUrl` returned by the backend through:
 2. Copy the backend URL into the frontend environment variable.
 3. Deploy the frontend.
 4. Test download, download-file, and history behavior in the browser.
-

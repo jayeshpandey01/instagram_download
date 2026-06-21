@@ -77,7 +77,14 @@ function Downloader({ onDownloadSuccess }) {
       } else if (err.response?.status === 404) {
         errorMessage = err.response.data?.error || 'Instagram post not found.';
       } else if (err.response?.status === 500 || err.response?.status === 502) {
-        errorMessage = err.response.data?.error || err.response.data?.details || 'Server error while fetching media.';
+        const backendMessage = err.response.data?.error || err.response.data?.details || '';
+        if (/blocked|rejected|metadata/i.test(backendMessage)) {
+          errorMessage = 'Instagram blocked the metadata request. Try again later or use a different public post.';
+        } else if (/login|private/i.test(backendMessage)) {
+          errorMessage = 'Instagram requires login for this content.';
+        } else {
+          errorMessage = backendMessage || 'Server error while fetching media.';
+        }
       } else if (err.code === 'ECONNABORTED') {
         errorMessage = 'Request timeout. Please try again with a different link.';
       } else if (err.message === 'Network Error') {

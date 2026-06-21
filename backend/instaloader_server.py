@@ -3,6 +3,8 @@ import re
 import os
 import threading
 import time
+from html import unescape
+from http.cookies import SimpleCookie
 from datetime import timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse, urlencode
@@ -52,6 +54,15 @@ state_lock = threading.Lock()
 for proxy_var in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
     os.environ.pop(proxy_var, None)
 
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/125.0.0.0 Safari/537.36"
+)
+INSTAGRAM_SESSIONID = os.getenv("INSTAGRAM_SESSIONID", "").strip()
+INSTAGRAM_CSRFTOKEN = os.getenv("INSTAGRAM_CSRFTOKEN", "").strip()
+INSTAGRAM_COOKIE_HEADER = os.getenv("INSTAGRAM_COOKIE_HEADER", "").strip()
+
 
 def now_ms():
     return int(time.time() * 1000)
@@ -72,6 +83,104 @@ def normalize_filename(value: str, fallback: str = "instagram-media") -> str:
         pass
 
     return safe
+
+
+def infer_media_type(media_url: str, fallback: str = "image") -> str:
+    if not media_url:
+        return fallback
+
+    lower = media_url.lower()
+    if re.search(r"\.(mp4|mov|m4v|webm)(\?|#|$)", lower):
+        return "video"
+    if re.search(r"\.(jpg|jpeg|png|gif|webp)(\?|#|$)", lower):
+        return "image"
+    if "video" in lower:
+        return "video"
+    return fallback
+
+
+def is_likely_media_url(value: str) -> bool:
+    if not value or not value.startswith(("http://", "https://")):
+        return False
+
+    lower = value.lower()
+    if re.search(r"instagram\.com/(?:p|tv|reel)/[\w-]+/?", lower):
+        return False
+
+    has_media_extension = re.search(r"\.(mp4|mov|m4v|jpg|jpeg|png|gif|webp|webm)(\?|#|$)", lower)
+    has_cdn_hint = re.search(r"(fbcdn\.net|scontent|cdninstagram|instagramcdn)", lower)
+    return bool(has_media_extension or has_cdn_hint)
+
+
+def dedupe_urls(values):
+    seen = set()
+    ordered = []
+    for value in values:
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        ordered.append(value)
+    return ordered
+
+
+def build_requests_session():
+    session = requests.Session()
+    session.trust_env = False
+    session.proxies.clear()
+    session.headers.update({
+        "User-Agent": USER_AGENT,
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    })
+    return session
+
+
+def apply_cookie_header(session, cookie_header: str):
+    if not cookie_header:
+        return
+
+    parsed = SimpleCookie()
+    try:
+        parsed.load(cookie_header)
+    except Exception:
+        return
+
+    for key, morsel in parsed.items():
+        session.cookies.set(key, morsel.value, domain=".instagram.com", path="/")
+
+
+def apply_instagram_session(loader):
+    session = loader.context._session
+    session.trust_env = False
+    session.proxies.clear()
+    session.headers.update({
+        "User-Agent": USER_AGENT,
+        "Accept-Language": "en-US,en;q=0.9",
+    })
+
+    if INSTAGRAM_COOKIE_HEADER:
+        apply_cookie_header(session, INSTAGRAM_COOKIE_HEADER)
+
+    if INSTAGRAM_SESSIONID:
+        session.cookies.set("sessionid", INSTAGRAM_SESSIONID, domain=".instagram.com", path="/")
+
+    if INSTAGRAM_CSRFTOKEN:
+        session.cookies.set("csrftoken", INSTAGRAM_CSRFTOKEN, domain=".instagram.com", path="/")
+
+
+def build_instaloader_loader():
+    loader = instaloader.Instaloader(
+        sleep=False,
+        quiet=True,
+        download_pictures=False,
+        download_videos=False,
+        download_video_thumbnails=False,
+        download_comments=False,
+        save_metadata=False,
+        compress_json=False,
+    )
+    apply_instagram_session(loader)
+    return loader
 
 
 def validate_instagram_url(url: str) -> bool:
@@ -96,50 +205,147 @@ def build_item(media_url: str, shortcode: str, index: int = 0, is_video: bool = 
     }
 
 
-def fetch_post_data(url: str):
-    shortcode = extract_shortcode(url)
-    loader = instaloader.Instaloader(
-        sleep=False,
-        quiet=True,
-        download_pictures=False,
-        download_videos=False,
-        download_video_thumbnails=False,
-        download_comments=False,
-        save_metadata=False,
-        compress_json=False,
-    )
-    loader.context._session.trust_env = False
-    loader.context._session.proxies.clear()
+class DownloadError(Exception):
+    def __init__(self, status: int, message: str, details: str | None = None):
+        super().__init__(message)
+        self.status = status
+        self.message = message
+        self.details = details
 
-    post = instaloader.Post.from_shortcode(loader.context, shortcode)
+
+def extract_meta_values(html: str, keys):
+    values = []
+    meta_tags = re.findall(r"<meta\b[^>]*>", html, re.I)
+
+    for tag in meta_tags:
+        attrs = dict(re.findall(r'([a-zA-Z_:.-]+)\s*=\s*["\']([^"\']*)["\']', tag))
+        key = attrs.get("property") or attrs.get("name")
+        content = attrs.get("content")
+        if key and content and key.lower() in keys:
+            values.append(unescape(content).strip())
+
+    return values
+
+
+def extract_json_ld_values(html: str):
+    values = []
+    scripts = re.findall(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', html, re.I | re.S)
+
+    for raw_script in scripts:
+        raw_script = raw_script.strip()
+        if not raw_script:
+            continue
+        try:
+            parsed = json.loads(unescape(raw_script))
+        except Exception:
+            continue
+
+        stack = [parsed]
+        while stack:
+            current = stack.pop()
+            if isinstance(current, dict):
+                for key in ("contentUrl", "thumbnailUrl", "url", "image", "video"):
+                    if key in current and current[key]:
+                        stack.append(current[key])
+                continue
+            if isinstance(current, list):
+                stack.extend(current)
+                continue
+            if isinstance(current, str):
+                values.append(current.strip())
+
+    return values
+
+
+def fetch_public_fallback(url: str, shortcode: str):
+    session = build_requests_session()
+    response = session.get(url, timeout=20, allow_redirects=True)
+    response.raise_for_status()
+    html = response.text
+
+    media_urls = []
+    media_urls.extend(extract_meta_values(html, {"og:image", "og:video", "twitter:image", "twitter:player:stream"}))
+    media_urls.extend(extract_json_ld_values(html))
+    media_urls = dedupe_urls([value for value in media_urls if isinstance(value, str) and is_likely_media_url(value)])
 
     items = []
-    if getattr(post, "typename", "") == "GraphSidecar":
-        nodes = list(post.get_sidecar_nodes())
-        for idx, node in enumerate(nodes):
-            node_is_video = bool(getattr(node, "is_video", False))
-            media_url = getattr(node, "video_url", None) if node_is_video else getattr(node, "display_url", None)
-            if not media_url:
-                media_url = getattr(node, "url", None)
-            if media_url:
-                items.append(build_item(media_url, shortcode, idx, node_is_video))
-    else:
-        is_video = bool(getattr(post, "is_video", False))
-        media_url = getattr(post, "video_url", None) if is_video else getattr(post, "url", None)
-        if media_url:
-            items.append(build_item(media_url, shortcode, 0, is_video))
+    for idx, media_url in enumerate(media_urls):
+        media_type = infer_media_type(media_url, "image")
+        items.append(build_item(media_url, shortcode, idx, media_type == "video"))
 
     raw = {
         "shortcode": shortcode,
-        "typename": getattr(post, "typename", None),
-        "is_video": bool(getattr(post, "is_video", False)),
-        "owner_username": getattr(getattr(post, "owner_profile", None), "username", None),
-        "caption": getattr(post, "caption", None),
-        "date_utc": post.date_utc.replace(tzinfo=timezone.utc).isoformat() if getattr(post, "date_utc", None) else None,
-        "media_count": getattr(post, "mediacount", None),
+        "typename": "Fallback",
+        "source": "public-html",
+        "title": None,
+        "caption": None,
+        "pageUrl": response.url,
+        "media_count": len(items),
     }
 
     return {"items": items, "raw": raw}
+
+
+def fetch_post_data(url: str):
+    shortcode = extract_shortcode(url)
+
+    try:
+        loader = build_instaloader_loader()
+        post = instaloader.Post.from_shortcode(loader.context, shortcode)
+
+        items = []
+        if getattr(post, "typename", "") == "GraphSidecar":
+            nodes = list(post.get_sidecar_nodes())
+            for idx, node in enumerate(nodes):
+                node_is_video = bool(getattr(node, "is_video", False))
+                media_url = getattr(node, "video_url", None) if node_is_video else getattr(node, "display_url", None)
+                if not media_url:
+                    media_url = getattr(node, "url", None)
+                if media_url:
+                    items.append(build_item(media_url, shortcode, idx, node_is_video))
+        else:
+            is_video = bool(getattr(post, "is_video", False))
+            media_url = getattr(post, "video_url", None) if is_video else getattr(post, "url", None)
+            if media_url:
+                items.append(build_item(media_url, shortcode, 0, is_video))
+
+        raw = {
+            "shortcode": shortcode,
+            "typename": getattr(post, "typename", None),
+            "is_video": bool(getattr(post, "is_video", False)),
+            "owner_username": getattr(getattr(post, "owner_profile", None), "username", None),
+            "caption": getattr(post, "caption", None),
+            "date_utc": post.date_utc.replace(tzinfo=timezone.utc).isoformat() if getattr(post, "date_utc", None) else None,
+            "media_count": getattr(post, "mediacount", None),
+            "provider": "instaloader",
+        }
+
+        if items:
+            return {"items": items, "raw": raw, "provider": "instaloader"}
+
+        raise DownloadError(502, "Instagram returned a post without accessible media.", "No media URLs were extracted from Instaloader.")
+    except DownloadError:
+        raise
+    except Exception as primary_exc:
+        fallback_exc = None
+        try:
+            fallback_result = fetch_public_fallback(url, shortcode)
+            if fallback_result["items"]:
+                fallback_result["provider"] = "public-html"
+                fallback_result["fallback"] = True
+                fallback_result["raw"]["fallback_reason"] = str(primary_exc)
+                fallback_result["raw"]["provider"] = "public-html"
+                fallback_result["raw"]["fallback"] = True
+                return fallback_result
+            fallback_exc = "No media URLs were found in the public HTML fallback."
+        except Exception as fallback_error:
+            fallback_exc = str(fallback_error)
+
+        status, user_message = classify_instaloader_error(primary_exc)
+        details = str(primary_exc)
+        if fallback_exc:
+            details = f"{details} | Fallback: {fallback_exc}"
+        raise DownloadError(status, user_message, details)
 
 
 def classify_instaloader_error(exc: Exception):
@@ -150,13 +356,15 @@ def classify_instaloader_error(exc: Exception):
         return 429, "Instagram is rate-limiting this request. Try again later."
     if "login required" in lowered or "please login" in lowered:
         return 403, "Instagram requires login for this content."
+    if "private" in lowered or "not accessible" in lowered:
+        return 403, "Instagram requires login for this content."
     if "not found" in lowered or "404" in lowered:
         return 404, "Instagram post not found."
     if "proxyerror" in lowered or "connection refused" in lowered:
         return 502, "The backend could not reach Instagram from this host."
     if "ssl" in lowered or "certificate" in lowered:
         return 502, "SSL/TLS failed while connecting to Instagram."
-    if "graphql/query" in lowered or "json query" in lowered:
+    if "graphql/query" in lowered or "json query" in lowered or "feedback_required" in lowered:
         return 502, "Instagram blocked or rejected the metadata request."
     return 500, "Failed to download content. Please check the URL and try again."
 
@@ -371,7 +579,7 @@ class Handler(BaseHTTPRequestHandler):
                     "sourceUrl": url,
                     "items": cached["items"],
                     "raw": cached["raw"],
-                    "provider": "instaloader",
+                    "provider": cached["raw"].get("provider", "instaloader") if isinstance(cached.get("raw"), dict) else "instaloader",
                     "cached": True,
                     "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + "Z",
                 },
@@ -385,6 +593,22 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             result = fetch_post_data(url)
+        except DownloadError as exc:
+            print(f"[instaloader] {exc.status} {exc.details or exc.message}")
+            self._json(
+                exc.status,
+                {
+                    "error": exc.message,
+                    "details": exc.details,
+                    "provider": "instaloader",
+                },
+                {
+                    "X-RateLimit-Limit": RATE_LIMIT,
+                    "X-RateLimit-Remaining": remaining,
+                    "X-RateLimit-Reset": int(reset_at * 1000),
+                },
+            )
+            return
         except Exception as exc:
             status, user_message = classify_instaloader_error(exc)
             print(f"[instaloader] {status} {exc}")
@@ -411,7 +635,8 @@ class Handler(BaseHTTPRequestHandler):
                 "sourceUrl": url,
                 "items": result["items"],
                 "raw": result["raw"],
-                "provider": "instaloader",
+                "provider": result.get("provider", "instaloader"),
+                "fallback": result.get("fallback", False),
                 "cached": False,
                 "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + "Z",
             },
