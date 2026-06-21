@@ -37,7 +37,10 @@ FRONTEND_ORIGINS = {
 }
 frontend_url = os.getenv("FRONTEND_URL")
 if frontend_url:
-    FRONTEND_ORIGINS.add(frontend_url)
+    FRONTEND_ORIGINS.update({origin.strip() for origin in frontend_url.split(",") if origin.strip()})
+frontend_urls = os.getenv("FRONTEND_URLS")
+if frontend_urls:
+    FRONTEND_ORIGINS.update({origin.strip() for origin in frontend_urls.split(",") if origin.strip()})
 RATE_LIMIT = 1000
 RATE_LIMIT_WINDOW_SECONDS = 1
 CACHE_TTL_SECONDS = 30 * 60
@@ -184,7 +187,7 @@ class Handler(BaseHTTPRequestHandler):
         if origin in FRONTEND_ORIGINS:
             self.send_header("Access-Control-Allow-Origin", origin)
         else:
-            self.send_header("Access-Control-Allow-Origin", "http://localhost:3000")
+            self.send_header("Access-Control-Allow-Origin", "null")
         self.send_header("Vary", "Origin")
         self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
